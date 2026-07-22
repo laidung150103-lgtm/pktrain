@@ -3,7 +3,7 @@
 
 This is a research baseline, not a claim of professional-level poker strength.
 It uses one shared agent for every seat (the information-state tensor contains
-the seat id), a four-action no-limit abstraction, and Neural Fictitious
+the seat id), an eight-action no-limit abstraction, and Neural Fictitious
 Self-Play (NFSP):
 
 * a Double-DQN learns an approximate best response;
@@ -17,10 +17,10 @@ Example:
 """
 
 from __future__ import annotations
-
 import argparse
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -38,6 +38,22 @@ from torch.nn import functional as F
 
 LOG = logging.getLogger("nfsp_holdem")
 
+# Compact neural action space. OpenSpiel's full-game action ids >= 2 are
+# integer "raise-to" chip amounts, which are mapped to/from these buckets.
+ABSTRACT_ACTIONS = (
+    "fold",
+    "check_call",
+    "raise_25pct_pot",
+    "raise_50pct_pot",
+    "raise_75pct_pot",
+    "raise_100pct_pot",
+    "raise_150pct_pot",
+    "all_in",
+)
+NUM_ABSTRACT_ACTIONS = len(ABSTRACT_ACTIONS)
+BET_FRACTIONS = (0.25, 0.50, 0.75, 1.00, 1.50)
+NUM_PLAYERS = 6
+
 
 @dataclass
 class Config:
@@ -48,8 +64,8 @@ class Config:
     hidden_size: int = 256
     hidden_layers: int = 3
     batch_size: int = 256
-    replay_capacity: int = 1_000_000
-    reservoir_capacity: int = 2_000_000
+    replay_capacity: int = 400_000
+    reservoir_capacity: int = 500_000
     replay_warmup: int = 20_000
     gamma: float = 1.0
     learning_rate: float = 1e-4
@@ -138,13 +154,16 @@ def make_game(cfg: Config) -> pyspiel.Game:
         "stack": " ".join([str(cfg.stack)] * 6),
         "blind": f"{cfg.small_blind} {cfg.big_blind} 0 0 0 0",
         "numRounds": 4,
-        "firstPlayer": "2 0 0 0",
+        # ACPC gamedef positions are 1-based: UTG (third seat after the
+        # button) acts first pre-flop; the small-blind seat acts post-flop.
+        "firstPlayer": "3 1 1 1",
         "numSuits": 4,
         "numRanks": 13,
         "numHoleCards": 2,
         "numBoardCards": "0 3 1 1",
-        # fold, check/call, pot-sized raise, all-in
-        "bettingAbstraction": "fcpa",
+        # Expose exact chip-sized raises; the policy-facing wrapper below
+        # reduces these to eight strategically useful abstract actions.
+        "bettingAbstraction": "fullgame",
     }
     game = pyspiel.load_game("universal_poker", params)
     if game.num_players() != 6:
@@ -152,9 +171,59 @@ def make_game(cfg: Config) -> pyspiel.Game:
     return game
 
 
-def legal_mask(state: pyspiel.State, num_actions: int) -> np.ndarray:
-    mask = np.zeros(num_actions, dtype=np.bool_)
-    mask[state.legal_actions()] = True
+def information_tensor(state: pyspiel.State, player: int, stack: int) -> np.ndarray:
+    """Return the info-state tensor with chip amounts normalized by stack."""
+    info = np.asarray(state.information_state_tensor(player), dtype=np.float32)
+    # Universal Poker's tensor is binary except for action-sequence bet sizes.
+    # Normalization prevents raw values as large as 10,000 destabilizing MLPs.
+    numeric = np.abs(info) > 1.0
+    info[numeric] /= float(stack)
+    return info
+
+
+def abstract_action_map(state: pyspiel.State) -> dict[int, int]:
+    """Map legal neural action ids to OpenSpiel full-game action ids.
+
+    Full-game raise actions form the contiguous range [minimum raise-to,
+    all-in raise-to]. A pot-fraction action means raising *to*
+      current_max_contribution + fraction * (pot + amount_to_call),
+    matching UniversalPokerState::PotSize(). Fractions that collapse to the
+    all-in amount are omitted because the explicit all-in bucket owns it.
+    """
+    raw_legal = state.legal_actions()
+    raw_set = set(raw_legal)
+    mapping: dict[int, int] = {}
+    if 0 in raw_set:
+        mapping[0] = 0
+    if 1 in raw_set:
+        mapping[1] = 1
+
+    raises = [action for action in raw_legal if action >= 2]
+    if not raises:
+        return mapping
+    minimum, maximum = min(raises), max(raises)
+    player = state.current_player()
+    contributions = np.asarray(state.observation_tensor(player)[-NUM_PLAYERS:])
+    pot = float(contributions.sum())
+    current_max = float(contributions.max())
+    amount_to_call = current_max - float(contributions[player])
+    pot_after_call = pot + amount_to_call
+
+    used = set(mapping.values())
+    for abstract_id, fraction in enumerate(BET_FRACTIONS, start=2):
+        target = int(math.floor(current_max + fraction * pot_after_call + 0.5))
+        target = max(minimum, min(maximum, target))
+        # Reserve the maximum raise for the unambiguous all-in bucket.
+        if target < maximum and target not in used:
+            mapping[abstract_id] = target
+            used.add(target)
+    mapping[7] = maximum
+    return mapping
+
+
+def legal_mask(action_map: dict[int, int]) -> np.ndarray:
+    mask = np.zeros(NUM_ABSTRACT_ACTIONS, dtype=np.bool_)
+    mask[list(action_map)] = True
     return mask
 
 
@@ -294,7 +363,7 @@ def play_training_hand(
     rng: np.random.Generator,
 ) -> np.ndarray:
     state = game.new_initial_state()
-    num_actions = game.num_distinct_actions()
+    num_actions = NUM_ABSTRACT_ACTIONS
     # NFSP chooses each player's policy mode for the whole episode.
     best_response_mode = rng.random(game.num_players()) < agent.cfg.anticipatory
     pending: list[Optional[tuple[np.ndarray, int]]] = [None] * game.num_players()
@@ -305,8 +374,9 @@ def play_training_hand(
             continue
 
         player = state.current_player()
-        info = np.asarray(state.information_state_tensor(player), dtype=np.float32)
-        mask = legal_mask(state, num_actions)
+        info = information_tensor(state, player, agent.cfg.stack)
+        action_map = abstract_action_map(state)
+        mask = legal_mask(action_map)
 
         # The reward between two decisions is zero in terminal-reward poker.
         if pending[player] is not None:
@@ -319,7 +389,7 @@ def play_training_hand(
         else:
             action = agent.act_average(info, mask)
         pending[player] = (info, action)
-        state.apply_action(action)
+        state.apply_action(action_map[action])
         agent.environment_steps += 1
         agent.maybe_train()
 
@@ -330,7 +400,14 @@ def play_training_hand(
         if item is not None:
             info, action = item
             agent.replay.add(
-                Transition(info, action, float(returns[player]), zero_info, True, zero_mask)
+                Transition(
+                    info,
+                    action,
+                    float(returns[player]) / agent.cfg.big_blind,
+                    zero_info,
+                    True,
+                    zero_mask,
+                )
             )
     return returns
 
@@ -354,14 +431,14 @@ def evaluate(
                 action = sample_chance(state, rng)
             else:
                 player = state.current_player()
-                mask = legal_mask(state, game.num_distinct_actions())
+                action_map = abstract_action_map(state)
+                mask = legal_mask(action_map)
                 if player == hero:
-                    info = np.asarray(
-                        state.information_state_tensor(player), dtype=np.float32
-                    )
-                    action = agent.act_average(info, mask, stochastic=True)
+                    info = information_tensor(state, player, agent.cfg.stack)
+                    abstract_action = agent.act_average(info, mask, stochastic=True)
                 else:
-                    action = int(rng.choice(np.flatnonzero(mask)))
+                    abstract_action = int(rng.choice(np.flatnonzero(mask)))
+                action = action_map[abstract_action]
             state.apply_action(action)
         result = float(state.returns()[hero])
         profit += result
@@ -379,7 +456,8 @@ def evaluate(
 def save_checkpoint(path: Path, agent: NFSPAgent, cfg: Config, episode: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format_version": 1,
+        "format_version": 2,
+        "action_space": list(ABSTRACT_ACTIONS),
         "episode": episode,
         "config": asdict(cfg),
         "agent": agent.checkpoint(),
@@ -396,11 +474,19 @@ def save_checkpoint(path: Path, agent: NFSPAgent, cfg: Config, episode: int) -> 
 
 def load_checkpoint(path: Path, agent: NFSPAgent, restore_rng: bool = True) -> int:
     payload = torch.load(path, map_location=agent.device, weights_only=False)
+    if payload.get("action_space") != list(ABSTRACT_ACTIONS):
+        raise ValueError(
+            "This checkpoint is not an eight-action full-game checkpoint. "
+            "The old four-action checkpoint cannot be resumed; train the new "
+            "model without --resume and use a separate checkpoint directory."
+        )
     agent.restore(payload["agent"])
     if restore_rng and "rng" in payload:
         random.setstate(payload["rng"]["python"])
         np.random.set_state(payload["rng"]["numpy"])
-        torch.set_rng_state(payload["rng"]["torch"])
+        # map_location may move this tensor to CUDA, while the default RNG
+        # generator always requires a CPU ByteTensor.
+        torch.set_rng_state(payload["rng"]["torch"].cpu())
     return int(payload.get("episode", 0))
 
 
@@ -448,13 +534,13 @@ def main() -> None:
     device = choose_device(args.device)
     game = make_game(cfg)
     info_size = game.information_state_tensor_shape()[0]
-    agent = NFSPAgent(info_size, game.num_distinct_actions(), cfg, device)
+    agent = NFSPAgent(info_size, NUM_ABSTRACT_ACTIONS, cfg, device)
     LOG.info(
         "game=%s players=%d info=%d actions=%d device=%s",
         game.get_type().short_name,
         game.num_players(),
         info_size,
-        game.num_distinct_actions(),
+        NUM_ABSTRACT_ACTIONS,
         device,
     )
 
